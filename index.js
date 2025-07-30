@@ -1,293 +1,197 @@
-/**
- * 𝐌𝐀𝐗𝐓𝐄𝐂𝐇_𝐗𝐌𝐃- A WhatsApp Bot
- * Copyright (c) 2025 𝐌𝐀𝐗𝐓𝐄𝐂𝐇 𝐃𝐄𝐕
- * 
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the MIT License.
- * 
- * Credits:
- * - Baileys Library by @adiwajshing
- * - Pair Code implementation inspired by TechGod143 & DGXEON
- */
-require('./settings')
-const { Boom } = require('@hapi/boom')
-const fs = require('fs')
-const chalk = require('chalk')
-const FileType = require('file-type')
-const path = require('path')
-const axios = require('axios')
+// index.js — MAXTECH_XMD WhatsApp bot with Telegram control
+const fs = require('fs');
+const path = require('path');
+const chalk = require('chalk');
+const NodeCache = require("node-cache");
+const pino = require("pino");
+const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, DisconnectReason } = require("@whiskeysockets/baileys");
 const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main');
-const PhoneNumber = require('awesome-phonenumber')
-const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('./lib/exif')
-const { smsg, isUrl, generateMessageTag, getBuffer, getSizeMedia, fetch, await, sleep, reSize } = require('./lib/myfunc')
-const { 
-    default: makeWASocket,
-    useMultiFileAuthState, 
-    DisconnectReason, 
-    fetchLatestBaileysVersion,
-    generateForwardMessageContent,
-    prepareWAMessageMedia,
-    generateWAMessageFromContent,
-    generateMessageID,
-    downloadContentFromMessage,
-    makeInMemoryStore,
-    jidDecode,
-    proto,
-    jidNormalizedUser,
-    makeCacheableSignalKeyStore,
-    delay
-} = require("@whiskeysockets/baileys")
-const NodeCache = require("node-cache")
-const pino = require("pino")
-const readline = require("readline")
-const { parsePhoneNumber } = require("libphonenumber-js")
-const { PHONENUMBER_MCC } = require('@whiskeysockets/baileys/lib/Utils/generics')
-const { rmSync, existsSync } = require('fs')
-const { join } = require('path')
+const store = require('./lib/basestore')('./store', { maxMessagesPerChat: 100, memoryOnly: false });
 
-const createToxxicStore = require('./lib/basestore');
-const store = createToxxicStore('./store', {
-  maxMessagesPerChat: 100,  
-  memoryOnly: false 
-});
-    
-let phoneNumber = "256747122756"
-let owner = JSON.parse(fs.readFileSync('./data/owner.json'))
+const { Telegraf } = require("telegraf");
 
-global.botname = "MAXTECH XMD"
-global.themeemoji = "•"
+// 👉 SET YOUR BOT TOKEN HERE 👇
+const BOT_TOKEN = "7685908343:AAHbU1aj_vCTrPnDqMctV-zK0cP8eQvyROs";
+const OWNER_ID = "7802048260"; // optional (e.g., your Telegram user ID)
 
-const settings = require('./settings')
-const pairingCode = !!phoneNumber || process.argv.includes("--pairing-code")
-const useMobile = process.argv.includes("--mobile")
+const bot = new Telegraf(BOT_TOKEN);
+const connectedUsersFile = path.join(__dirname, 'connectedUsers.json');
+let connectedUsers = fs.existsSync(connectedUsersFile) ? JSON.parse(fs.readFileSync(connectedUsersFile)) : {};
+function saveUsers() {
+    fs.writeFileSync(connectedUsersFile, JSON.stringify(connectedUsers, null, 2));
+}
 
-// Only create readline interface if we're in an interactive environment
-const rl = process.stdin.isTTY ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null
-const question = (text) => {
-    if (rl) {
-        return new Promise((resolve) => rl.question(text, resolve))
+const sessions = {};
+
+// 🟢 /pair command
+bot.command("pair", async (ctx) => {
+    const args = ctx.message.text.split(" ");
+    if (args.length !== 2) return ctx.reply("Usage: /pair <whatsapp_number>");
+    const number = args[1].replace(/\D/g, '');
+    ctx.reply(`⏳ Starting WhatsApp session for ${number}...`);
+    const result = await startWhatsAppBot(number, ctx.chat.id);
+    if (result.success) {
+        ctx.reply(`✅ Session ready for +${number}. Pairing code sent.`);
     } else {
-        // In non-interactive environment, use ownerNumber from settings
-        return Promise.resolve(settings.ownerNumber || phoneNumber)
+        ctx.reply(`❌ Failed: ${result.error}`);
     }
-}
+});
 
-         
-async function startXeonBotInc() {
-    let { version, isLatest } = await fetchLatestBaileysVersion()
-    const { state, saveCreds } = await useMultiFileAuthState(`./session`)
-    const msgRetryCounterCache = new NodeCache()
+// 📋 /status command
+bot.command("status", async (ctx) => {
+    const chatId = ctx.chat.id;
+    const userSessions = connectedUsers[chatId];
+    if (!userSessions || userSessions.length === 0) {
+        return ctx.reply("😕 You have no active WhatsApp sessions.");
+    }
+    const msg = userSessions.map((s, i) => `🔢 ${i + 1}. +${s.phoneNumber}`).join("\n");
+    ctx.reply(`📋 Connected WhatsApp sessions:\n${msg}`);
+});
 
-    const XeonBotInc = makeWASocket({
-        version,
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: !pairingCode,
-        browser: ["Ubuntu", "Chrome", "20.0.04"],
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
-        },
-        markOnlineOnConnect: true,
-        generateHighQualityLinkPreview: true,
-        getMessage: async (key) => {
-            let jid = jidNormalizedUser(key.remoteJid)
-            let msg = await store.loadMessage(jid, key.id)
-            return msg?.message || ""
-        },
-        msgRetryCounterCache,
-        defaultQueryTimeoutMs: undefined,
-    })
+// 📣 /broadcast <msg> command
+bot.command("broadcast", async (ctx) => {
+    const args = ctx.message.text.split(" ");
+    if (args.length < 2) return ctx.reply("Usage: /broadcast <message>");
+    const chatId = ctx.chat.id;
+    const userSessions = connectedUsers[chatId];
+    if (!userSessions || userSessions.length === 0) {
+        return ctx.reply("😕 You have no active WhatsApp sessions.");
+    }
 
-    store.bind(XeonBotInc.ev)
+    const message = ctx.message.text.replace("/broadcast", "").trim();
+    let successCount = 0;
 
-    // Message handling
-    XeonBotInc.ev.on('messages.upsert', async chatUpdate => {
+    for (const session of userSessions) {
+        const client = sessions[session.phoneNumber];
+        if (!client) continue;
         try {
-            const mek = chatUpdate.messages[0]
-            if (!mek.message) return
-            mek.message = (Object.keys(mek.message)[0] === 'ephemeralMessage') ? mek.message.ephemeralMessage.message : mek.message
-            if (mek.key && mek.key.remoteJid === 'status@broadcast') {
-                await handleStatus(XeonBotInc, chatUpdate);
-                return;
-            }
-            if (!XeonBotInc.public && !mek.key.fromMe && chatUpdate.type === 'notify') return
-            if (mek.key.id.startsWith('BAE5') && mek.key.id.length === 16) return
-            
-            try {
-                await handleMessages(XeonBotInc, chatUpdate, true)
-            } catch (err) {
-                console.error("Error in handleMessages:", err)
-                // Only try to send error message if we have a valid chatId
-                if (mek.key && mek.key.remoteJid) {
-                    await XeonBotInc.sendMessage(mek.key.remoteJid, { 
-                        text: '🚫 An error occurred while processing your message.',
-                        contextInfo: {
-                            forwardingScore: 1,
-                            isForwarded: true,
-                            forwardedNewsletterMessageInfo: {
-                                newsletterJid: '120363400964601488@newsletter',
-                                newsletterName: '𝐌𝐀𝐗𝐓𝐄𝐂𝐇_𝐗𝐌𝐃',
-                                serverMessageId: -1
-                            }
-                        }
-                    }).catch(console.error);
-                }
-            }
-        } catch (err) {
-            console.error("Error in messages.upsert:", err)
+            await client.sendMessage(client.user.id, { text: `📢 Broadcast:\n${message}` });
+            successCount++;
+        } catch (e) {
+            console.log(`❌ Broadcast failed to ${session.phoneNumber}`);
         }
-    })
-
-    // Add these event handlers for better functionality
-    XeonBotInc.decodeJid = (jid) => {
-        if (!jid) return jid
-        if (/:\d+@/gi.test(jid)) {
-            let decode = jidDecode(jid) || {}
-            return decode.user && decode.server && decode.user + '@' + decode.server || jid
-        } else return jid
     }
 
-    XeonBotInc.ev.on('contacts.update', update => {
-        for (let contact of update) {
-            let id = XeonBotInc.decodeJid(contact.id)
-            if (store && store.contacts) store.contacts[id] = { id, name: contact.notify }
-        }
-    })
+    ctx.reply(`✅ Broadcast sent to ${successCount} WhatsApp session(s).`);
+});
 
-    XeonBotInc.getName = (jid, withoutContact = false) => {
-        id = XeonBotInc.decodeJid(jid)
-        withoutContact = XeonBotInc.withoutContact || withoutContact 
-        let v
-        if (id.endsWith("@g.us")) return new Promise(async (resolve) => {
-            v = store.contacts[id] || {}
-            if (!(v.name || v.subject)) v = XeonBotInc.groupMetadata(id) || {}
-            resolve(v.name || v.subject || PhoneNumber('+' + id.replace('@s.whatsapp.net', '')).getNumber('international'))
-        })
-        else v = id === '0@s.whatsapp.net' ? {
-            id,
-            name: 'WhatsApp'
-        } : id === XeonBotInc.decodeJid(XeonBotInc.user.id) ?
-            XeonBotInc.user :
-            (store.contacts[id] || {})
-        return (withoutContact ? '' : v.name) || v.subject || v.verifiedName || PhoneNumber('+' + jid.replace('@s.whatsapp.net', '')).getNumber('international')
-    }
-
-    XeonBotInc.public = true
-
-    XeonBotInc.serializeM = (m) => smsg(XeonBotInc, m, store)
-
-    // Handle pairing code
-    if (pairingCode && !XeonBotInc.authState.creds.registered) {
-        if (useMobile) throw new Error('Cannot use pairing code with mobile api')
-
-        let phoneNumber
-        if (!!global.phoneNumber) {
-            phoneNumber = global.phoneNumber
-        } else {
-            phoneNumber = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 🪯\nFor example: 256747122756 : `)))
-        }
-
-        phoneNumber = phoneNumber.replace(/[^0-9]/g, '')
-
-        // Request pairing code
-        setTimeout(async () => {
-            let code = await XeonBotInc.requestPairingCode(phoneNumber)
-            code = code?.match(/.{1,4}/g)?.join("-") || code
-            console.log(chalk.black(chalk.bgGreen(`Your Pairing Code☛ : `)), chalk.black(chalk.white(code)))
-        }, 3000)
-    }
-
-    // Connection handling
-    XeonBotInc.ev.on('connection.update', async (s) => {
-        const { connection, lastDisconnect } = s
-        if (connection == "open") {
-            console.log(chalk.magenta(` `))
-            console.log(chalk.yellow(`🌿Connected to => ` + JSON.stringify(XeonBotInc.user, null, 2)))
-            
-            // Send message to bot's own number
-            const botNumber = XeonBotInc.user.id.split(':')[0] + '@s.whatsapp.net';
-            await XeonBotInc.sendMessage(botNumber, { 
-                text: `𝕄𝔸𝕏𝕋𝔼ℂℍ_𝕏𝕄𝔻 𝕊ℙ𝔼𝔼𝔻!\n\n✅️ Time: ${new Date().toLocaleString()}`,
-                contextInfo: {
-                    forwardingScore: 1,
-                    isForwarded: true,
-                    forwardedNewsletterMessageInfo: {
-                        newsletterJid: '120363400964601488@newsletter',
-                        newsletterName: '𝐌𝐀𝐗𝐓𝐄𝐂𝐇_𝐗𝐌𝐃',
-                        serverMessageId: -1
-                    }
-                }
-            });
-
-            await delay(1999)
-            console.log(chalk.yellow(`\n\n                  ${chalk.bold.blue(`[ ${global.botname || '𝐌𝐀𝐗𝐓𝐄𝐂𝐇_𝐗𝐌𝐃'} ]`)}\n\n`))
-            console.log(chalk.cyan(`< ================================================== >`))
-            console.log(chalk.magenta(`\n${global.themeemoji || '•'} YT CHANNEL: 𝐌𝐀𝐗𝐓𝐄𝐂𝐇_𝐗𝐌𝐃`))
-            console.log(chalk.magenta(`${global.themeemoji || '•'} GITHUB: 𝐌𝐀𝐗𝐓𝐄𝐂𝐇 `))
-            console.log(chalk.magenta(`${global.themeemoji || '•'} WA NUMBER: ${owner}`))
-            console.log(chalk.magenta(`${global.themeemoji || '•'} CREDIT: 𝐌𝐀𝐗𝐓𝐄𝐂𝐇 𝐃𝐄𝐕 `))
-            console.log(chalk.green(`${global.themeemoji || '•'} 𝐼 𝐴𝑀 𝐴𝑉𝐼𝐿𝐸 𝐌𝐀𝐗𝐓𝐄𝐂𝐇_𝐗𝐌𝐃 BY 𝐌𝐀𝐗𝐓𝐄𝐂𝐇 𝐃𝐄𝐕`))
-        }
-        if (
-            connection === "close" &&
-            lastDisconnect &&
-            lastDisconnect.error &&
-            lastDisconnect.error.output.statusCode != 401
-        ) {
-            startXeonBotInc()
-        }
-    })
-
-    XeonBotInc.ev.on('creds.update', saveCreds)
+// ❌ /delsession <number>
+bot.command("delsession", async (ctx) => {
+    const args = ctx.message.text.split(" ");
+    if (args.length !== 2) return ctx.reply("Usage: /delsession <whatsapp_number>");
     
-    // Modify the event listener to log the update object
-    XeonBotInc.ev.on('group-participants.update', async (update) => {
-        //console.log('Group Update Event:', JSON.stringify(update, null, 2));  // Add this line to debug
-        await handleGroupParticipantUpdate(XeonBotInc, update);
-    });
+    const number = args[1].replace(/\D/g, '');
+    const sessionDir = path.join(__dirname, "session", number);
 
-    // Add status update handlers
-    XeonBotInc.ev.on('messages.upsert', async (m) => {
-        if (m.messages[0].key && m.messages[0].key.remoteJid === 'status@broadcast') {
-            await handleStatus(XeonBotInc, m);
+    if (!fs.existsSync(sessionDir)) {
+        return ctx.reply(`❌ Session for +${number} does not exist.`);
+    }
+
+    const chatId = ctx.chat.id;
+    if (connectedUsers[chatId]) {
+        connectedUsers[chatId] = connectedUsers[chatId].filter(s => s.phoneNumber !== number);
+        if (connectedUsers[chatId].length === 0) {
+            delete connectedUsers[chatId];
         }
-    });
+        saveUsers();
+    }
 
-    // Handle status updates
-    XeonBotInc.ev.on('status.update', async (status) => {
-        await handleStatus(XeonBotInc, status);
-    });
+    try {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+        ctx.reply(`✅ Session for +${number} deleted.`);
+    } catch (err) {
+        ctx.reply(`❌ Failed to delete session:\n${err.message}`);
+    }
+});
 
-    // Handle message reactions (some status updates come through here)
-    XeonBotInc.ev.on('messages.reaction', async (status) => {
-        await handleStatus(XeonBotInc, status);
-    });
+// Start Telegram bot
+bot.launch();
+console.log(chalk.green("🤖 Telegram bot started."));
 
-    return XeonBotInc
+// 🔌 WhatsApp Session Loader
+async function startWhatsAppBot(phoneNumber, telegramChatId) {
+    try {
+        const sessionDir = path.join(__dirname, "session", phoneNumber);
+        if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+
+        const { version } = await fetchLatestBaileysVersion();
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+
+        const client = makeWASocket({
+            version,
+            logger: pino({ level: "silent" }),
+            browser: ["Ubuntu", "Chrome", "20.0.04"],
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" })),
+            },
+            markOnlineOnConnect: true,
+        });
+
+        store.bind(client.ev);
+        sessions[phoneNumber] = client;
+
+        // Send pairing code
+        if (!client.authState.creds.registered) {
+            setTimeout(async () => {
+                try {
+                    let code = await client.requestPairingCode(phoneNumber);
+                    code = code?.match(/.{1,4}/g)?.join("-") || code;
+                    bot.telegram.sendMessage(telegramChatId, `🔑 Pairing Code for +${phoneNumber}:\n\`${code}\``, { parse_mode: "Markdown" });
+                } catch (err) {
+                    bot.telegram.sendMessage(telegramChatId, `❌ Could not generate pairing code:\n${err.message}`);
+                }
+            }, 3000);
+        }
+
+        // Save to connectedUsers
+        if (!connectedUsers[telegramChatId]) connectedUsers[telegramChatId] = [];
+        if (!connectedUsers[telegramChatId].find(s => s.phoneNumber === phoneNumber)) {
+            connectedUsers[telegramChatId].push({ phoneNumber, connectedAt: Date.now() });
+            saveUsers();
+        }
+
+        // Handle incoming messages
+        client.ev.on("messages.upsert", async (chatUpdate) => {
+            try {
+                const mek = chatUpdate.messages[0];
+                if (!mek.message) return;
+                if (mek.key.remoteJid === "status@broadcast") return handleStatus(client, chatUpdate);
+                await handleMessages(client, chatUpdate, true);
+            } catch (err) {
+                console.error("⚠️ Message handler error:", err);
+            }
+        });
+
+        client.ev.on("group-participants.update", async (update) => {
+            await handleGroupParticipantUpdate(client, update);
+        });
+
+        client.ev.on("creds.update", saveCreds);
+
+        client.ev.on("connection.update", async ({ connection, lastDisconnect }) => {
+            if (connection === "open") {
+                console.log(chalk.blue(`✅ Connected: +${phoneNumber}`));
+            } else if (connection === "close") {
+                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+                if (shouldReconnect) {
+                    await startWhatsAppBot(phoneNumber, telegramChatId);
+                }
+            }
+        });
+
+        return { success: true };
+    } catch (err) {
+        console.error(`❌ Session error:`, err);
+        return { success: false, error: err.message };
+    }
 }
 
-
-// Start the bot with error handling
-startXeonBotInc().catch(error => {
-    console.error('Fatal error:', error)
-    process.exit(1)
-})
-
-// Better error handling
-process.on('uncaughtException', (err) => {
-    console.error('Uncaught Exception:', err)
-    // Don't exit immediately to allow reconnection
-})
-
-process.on('unhandledRejection', (err) => {
-    console.error('Unhandled Rejection:', err)
-    // Don't exit immediately to allow reconnection
-})
-
-let file = require.resolve(__filename)
+// 🔁 Auto Reload on Save
+let file = require.resolve(__filename);
 fs.watchFile(file, () => {
-    fs.unwatchFile(file)
-    console.log(chalk.redBright(`Update ${__filename}`))
-    delete require.cache[file]
-    require(file)
-})
+    fs.unwatchFile(file);
+    console.log(chalk.redBright(`🔁 Reloaded ${__filename}`));
+    delete require.cache[file];
+    require(file);
+});
