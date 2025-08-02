@@ -40,7 +40,7 @@ async function playCommand(sock, chatId, message) {
         const formattedViews = views.toLocaleString();
 
         // Fetch audio data from API
-        const response = await axios.get(`https://apis-keith.vercel.app/download/dlmp3?url=${videoUrl}`);
+        const response = await axios.get(`https://apis-keith.vercel.app/download/spotify?q=${videoUrl}`);
         const data = response.data;
 
         if (!data || !data.status || !data.result || !data.result.downloadUrl) {
