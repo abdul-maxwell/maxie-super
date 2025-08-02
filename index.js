@@ -447,6 +447,19 @@ function findOwner(number) {
     }
     return "Unknown";
 }
+// ⚡ Render.com Port Binding Fix (Required!)
+const http = require('http');
+const PORT = process.env.PORT || 3000; // Render auto-assigns PORT
+
+// Minimal HTTP server (for Render compliance)
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('🤖 MAXTECH_XMD is running (Telegram -> WhatsApp Bridge)');
+});
+
+server.listen(PORT, () => {
+  console.log(chalk.yellow(`🌐 HTTP server running on port ${PORT}`));
+});
 
 // 🚀 LAUNCH BOTS =============================================
 publicBot.launch();
